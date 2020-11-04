@@ -73,6 +73,7 @@ type (
 	checkResponse struct {
 		name      string
 		skipOnErr bool
+		timeout   bool
 		err       error
 	}
 )
@@ -147,43 +148,57 @@ func (h *Health) Measure(ctx context.Context) Check {
 	status := StatusOK
 	total := len(h.checks)
 	failures := make(map[string]string)
-	resChan := make(chan checkResponse, total)
+	resChan := make(chan checkResponse)
 
 	var wg sync.WaitGroup
 	wg.Add(total)
 
 	go func() {
-		defer close(resChan)
+		for {
+			res, active := <-resChan
+			if !active {
+				return
+			}
 
-		wg.Wait()
+			if res.timeout {
+				failures[res.name] = string(StatusTimeout)
+				status = getAvailability(status, res.skipOnErr)
+				continue
+			}
+
+			if res.err == nil {
+				continue
+			}
+
+			failures[res.name] = res.err.Error()
+			status = getAvailability(status, res.skipOnErr)
+		}
 	}()
 
 	for _, c := range h.checks {
 		go func(c Config) {
 			defer wg.Done()
 
-			select {
-			case resChan <- checkResponse{c.Name, c.SkipOnErr, c.Check(ctx)}:
-			default:
-			}
-		}(c)
+			ctx, cancel := context.WithTimeout(ctx, c.Timeout)
+			defer cancel()
 
-	loop:
-		for {
+			checkResult := make(chan error)
+			go func() {
+				checkResult <- c.Check(ctx)
+				close(checkResult)
+			}()
+
 			select {
 			case <-time.After(c.Timeout):
-				failures[c.Name] = string(StatusTimeout)
-				status = getAvailability(status, c.SkipOnErr)
-				break loop
-			case res := <-resChan:
-				if res.err != nil {
-					failures[res.name] = res.err.Error()
-					status = getAvailability(status, res.skipOnErr)
-				}
-				break loop
+				resChan <- checkResponse{c.Name, c.SkipOnErr, true, nil}
+			case err := <-checkResult:
+				resChan <- checkResponse{c.Name, c.SkipOnErr, false, err}
 			}
-		}
+		}(c)
 	}
+
+	wg.Wait()
+	close(resChan)
 
 	return newCheck(status, failures)
 }
